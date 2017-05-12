@@ -31,12 +31,15 @@ import org.sonar.java.model.ExpressionUtils;
 import org.sonar.java.resolve.JavaSymbol;
 import org.sonar.java.se.checks.SyntaxTreeNameFinder;
 import org.sonar.java.se.constraint.Constraint;
+import org.sonar.java.se.constraint.ObjectConstraint;
 import org.sonar.java.se.symbolicvalues.SymbolicValue;
 import org.sonar.java.se.xproc.HappyPathYield;
 import org.sonar.java.se.xproc.MethodBehavior;
 import org.sonar.java.se.xproc.MethodYield;
 import org.sonar.plugins.java.api.JavaFileScannerContext;
+import org.sonar.plugins.java.api.JavaFileScannerContext.Location;
 import org.sonar.plugins.java.api.semantic.Symbol;
+import org.sonar.plugins.java.api.semantic.SymbolMetadata;
 import org.sonar.plugins.java.api.tree.Arguments;
 import org.sonar.plugins.java.api.tree.AssignmentExpressionTree;
 import org.sonar.plugins.java.api.tree.ExpressionTree;
@@ -221,11 +224,51 @@ public class FlowComputation {
 
       boolean endOfPath = visitedAllParents(edge) || shouldTerminate(learnedConstraints);
 
+      if (endOfPath) {
+        flowBuilder.addAll(flowForNullableMethodParameters(edge.parent));
+      }
+
       List<JavaFileScannerContext.Location> currentFlow = flowBuilder.build();
       Set<List<JavaFileScannerContext.Location>> yieldsFlows = flowFromYields(edge);
       return yieldsFlows.stream()
         .map(yieldFlow -> ImmutableList.<JavaFileScannerContext.Location>builder().addAll(currentFlow).addAll(yieldFlow).build())
         .map(f -> new ExecutionPath(edge, visited.add(edge), newTrackSymbols, f, endOfPath));
+    }
+
+    private List<Location> flowForNullableMethodParameters(ExplodedGraph.Node node) {
+      if (node.parent() != null || !domains.contains(ObjectConstraint.class)) {
+        return ImmutableList.of();
+      }
+      ImmutableList.Builder<JavaFileScannerContext.Location> flowBuilder = ImmutableList.builder();
+      trackedSymbols.forEach(symbol -> {
+        SymbolicValue sv = node.programState.getValue(symbol);
+        if (sv == null) {
+          return;
+        }
+        ObjectConstraint startConstraint = node.programState.getConstraint(sv, ObjectConstraint.class);
+        if (startConstraint != null && !isAnnotatedNullable(symbol) && isMethodParameter(symbol)) {
+          String msg;
+          if (ObjectConstraint.NULL == startConstraint) {
+            msg = "Implies '%s' can be null.";
+          } else {
+            msg = "Implies '%s' can not be null.";
+          }
+          flowBuilder.add(new JavaFileScannerContext.Location(String.format(msg, symbol.name()), ((VariableTree) symbol.declaration()).simpleName()));
+        }
+      });
+      return flowBuilder.build();
+    }
+
+    private boolean isAnnotatedNullable(Symbol symbol) {
+      SymbolMetadata metadata = symbol.metadata();
+      return metadata.isAnnotatedWith("javax.annotation.CheckForNull")
+        || metadata.isAnnotatedWith("javax.annotation.Nullable")
+        || metadata.isAnnotatedWith("javax.annotation.Nonnull");
+    }
+
+    private boolean isMethodParameter(Symbol symbol) {
+      Symbol owner = symbol.owner();
+      return owner.isMethodSymbol() && ((Symbol.MethodSymbol) owner).declaration().parameters().contains(symbol.declaration());
     }
 
     private List<JavaFileScannerContext.Location> flowFromLearnedConstraints(ExplodedGraph.Edge edge, Set<LearnedConstraint> learnedConstraints) {
